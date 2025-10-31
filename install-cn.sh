@@ -1,88 +1,57 @@
 #!/bin/bash
-#==============================================================================#
-# Debian12 NAS + Home Assistant + Mihomo (CN Enhanced)
-# Features:
-#   - Detect network & WARP connection
-#   - Download dependencies via WARP if available
-#   - Install Docker (official)
-#   - Install Home Assistant Supervised
-#   - Configure Samba NAS
-#   - Install Tailscale
-#   - Power saving (TLP + CPU powersave)
-#==============================================================================#
+#==============================================================================
+# Debian12 NAS + Home Assistant + Mihomo (CN Enhanced + Warp)
+# Auto-detect Docker installation, use Warp if available
+#==============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------------
-# Configuration
-# -------------------------
-NAS_USERNAME="nasuser"
-NAS_PASSWORD="nas123456"
-HA_MACHINE_TYPE="generic-x86-64"
 LOGFILE="/var/log/install-cn.log"
-
-# Mihomo / Clash or other dependencies download links
-MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-compatible.gz"
-
-# -------------------------
-# Logging functions
-# -------------------------
-log() { echo "[$(date +'%F %T')] $*" | tee -a "$LOGFILE"; }
-error() { echo -e "\033[31m[$(date +'%F %T')] ❌ ERROR: $*\033[0m" | tee -a "$LOGFILE" >&2; exit 1; }
-warn() { echo -e "\033[33m[$(date +'%F %T')] ⚠️ $*\033[0m" | tee -a "$LOGFILE"; }
-success() { echo -e "\033[32m[$(date +'%F %T')] ✅ $*\033[0m" | tee -a "$LOGFILE"; }
-
-# Initialize log
 mkdir -p "$(dirname "$LOGFILE")"
 touch "$LOGFILE"
 chmod 644 "$LOGFILE"
+
+log() { echo "[$(date +'%F %T')] $*" | tee -a "$LOGFILE"; }
+error() { echo -e "\033[31m[$(date +'%F %T')] ❌ ERROR: $*\033[0m" | tee -a "$LOGFILE" >&2; exit 1; }
+warn() { echo -e "\033[33m[$(date +'%F %T')] ⚠️  $*\033[0m" | tee -a "$LOGFILE"; }
+success() { echo -e "\033[32m[$(date +'%F %T')] ✅ $*\033[0m" | tee -a "$LOGFILE"; }
+
 trap 'error "Script interrupted. Check log: $LOGFILE"' ERR
 
 # -------------------------
-# Ensure root
+# Check root
 # -------------------------
 if [ "$(id -u)" -ne 0 ]; then
-    error "Please run as root"
+    error "This script must be run as root"
 fi
 
-# -------------------------
-# System check
-# -------------------------
-if ! grep -qi "debian.*12" /etc/os-release; then
-    warn "System is not Debian 12. Continue at your own risk."
-    read -r -p "Continue? [y/N]: " yn
-    [[ ! "$yn" =~ ^[Yy]$ ]] && error "User cancelled"
-fi
-
-log "Starting installation: Debian12 NAS + Home Assistant + Mihomo"
+log "Starting optimized installation: Debian12 NAS + Home Assistant + Mihomo (Warp Enabled)"
 
 # -------------------------
-# Check WARP
+# Warp detection
 # -------------------------
-USE_WARP=0
+USE_WARP=false
 if command -v warp-cli >/dev/null 2>&1; then
-    WARP_STATUS=$(warp-cli status 2>/dev/null | grep -i "Status update" | awk '{print $3}' || echo "Disconnected")
-    if [[ "$WARP_STATUS" == "Connected" ]]; then
-        log "WARP 已连接，可用于下载被墙资源"
-        USE_WARP=1
+    WARP_STATUS=$(warp-cli status | grep -i "Connected" || true)
+    if [ -n "$WARP_STATUS" ]; then
+        USE_WARP=true
+        success "Warp detected and connected"
     else
-        warn "WARP 未连接，下载墙外资源可能失败"
+        warn "Warp installed but not connected. Please run 'warp-cli registration new' and 'warp-cli connect'"
     fi
 else
-    warn "未安装 WARP CLI，可选安装 https://pkg.cloudflareclient.com/"
+    warn "Warp not installed. Please install Cloudflare Warp first."
 fi
 
 # -------------------------
-# Helper download function
+# Helper: download with Warp if available
 # -------------------------
-download_with_warp() {
-    local URL="$1"
-    local OUTPUT="$2"
-    if [[ "$USE_WARP" -eq 1 ]]; then
-        curl -L --retry 5 --connect-timeout 10 "$URL" -o "$OUTPUT" || error "下载失败: $URL"
+warp_curl() {
+    if $USE_WARP; then
+        curl -fsSL "$@"
     else
-        curl -L --retry 5 --connect-timeout 10 "$URL" -o "$OUTPUT" || warn "下载失败（未使用 WARP）: $URL"
+        curl -fsSL "$@"
     fi
 }
 
@@ -102,64 +71,59 @@ log "Installing base dependencies..."
 apt install -y curl wget ca-certificates apt-transport-https gnupg lsb-release \
     jq apparmor apparmor-utils avahi-daemon dbus network-manager \
     systemd-journal-remote software-properties-common \
-    samba tlp cpufrequtils smartmontools bash-completion || error "Dependencies failed"
+    samba tlp cpufrequtils smartmontools bash-completion
 success "Base dependencies installed"
 
 # -------------------------
-# Install Docker
+# Detect Docker
 # -------------------------
-log "Installing Docker..."
-mkdir -p /etc/apt/keyrings
-download_with_warp "https://download.docker.com/linux/debian/gpg" /etc/apt/keyrings/docker.gpg
-
-ARCH=$(dpkg --print-architecture)
-CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $CODENAME stable" > /etc/apt/sources.list.d/docker.list
-
-apt update -y
-apt install -y docker-ce docker-ce-cli containerd.io || error "Docker installation failed"
-systemctl enable docker
-systemctl start docker
-success "Docker installed"
+if command -v docker >/dev/null; then
+    success "Docker already installed, skipping installation"
+else
+    log "Installing Docker..."
+    mkdir -p /etc/apt/keyrings
+    warp_curl https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    CODENAME=$(grep VERSION_CODENAME /etc/os-release | cut -d'=' -f2)
+    ARCH=$(dpkg --print-architecture)
+    echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $CODENAME stable" > /etc/apt/sources.list.d/docker.list
+    apt update -y
+    apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    systemctl enable docker
+    systemctl start docker
+    success "Docker installed and started"
+fi
 
 # -------------------------
-# Install Home Assistant Supervised
+# Home Assistant Supervised
 # -------------------------
 log "Installing Home Assistant Supervised..."
-mkdir -p /opt/ha-install
-cd /opt/ha-install
-download_with_warp "https://ghproxy.com/https://github.com/home-assistant/supervised-installer/releases/latest/download/installer.sh" installer.sh
-chmod +x installer.sh
-bash installer.sh --machine "$HA_MACHINE_TYPE" || warn "HA installer returned non-zero"
-success "HA installation attempted"
-
-# -------------------------
-# Download Mihomo
-# -------------------------
-log "Downloading Mihomo..."
-mkdir -p /opt/mihomo
-download_with_warp "$MIHOMO_URL" /opt/mihomo/mihomo.gz
-gzip -d /opt/mihomo/mihomo.gz
-chmod +x /opt/mihomo/mihomo
-success "Mihomo downloaded"
+if systemctl is-active --quiet home-assistant-supervised; then
+    success "Home Assistant already running"
+else
+    mkdir -p /opt/ha-install
+    cd /opt/ha-install
+    INSTALLER_URL="https://ghproxy.com/https://github.com/home-assistant/supervised-installer/releases/latest/download/installer.sh"
+    warp_curl -fLo installer.sh "$INSTALLER_URL"
+    chmod +x installer.sh
+    bash installer.sh --machine generic-x86-64
+    systemctl enable home-assistant-supervised
+    success "Home Assistant installation attempted"
+fi
 
 # -------------------------
 # Configure Samba NAS
 # -------------------------
+NAS_USER="nasuser"
+NAS_PASS="nas123456"
 log "Configuring Samba NAS..."
-if id "$NAS_USERNAME" >/dev/null 2>&1; then
-    warn "User $NAS_USERNAME exists, updating password"
-    echo "${NAS_USERNAME}:${NAS_PASSWORD}" | chpasswd
-else
-    useradd -m -s /usr/sbin/nologin "$NAS_USERNAME"
-    echo "${NAS_USERNAME}:${NAS_PASSWORD}" | chpasswd
-    success "Created NAS user"
+if ! id "$NAS_USER" >/dev/null 2>&1; then
+    useradd -m -s /usr/sbin/nologin "$NAS_USER"
+    echo "$NAS_USER:$NAS_PASS" | chpasswd
+    success "Created NAS user $NAS_USER"
 fi
-
 mkdir -p /mnt/storage
-chown -R "$NAS_USERNAME:$NAS_USERNAME" /mnt/storage
+chown -R "$NAS_USER:$NAS_USER" /mnt/storage
 chmod 755 /mnt/storage
-
 cat > /etc/samba/smb.conf <<EOF
 [global]
    workgroup = WORKGROUP
@@ -175,51 +139,43 @@ cat > /etc/samba/smb.conf <<EOF
    path = /mnt/storage
    browseable = yes
    read only = no
-   valid users = $NAS_USERNAME
+   valid users = $NAS_USER
    guest ok = no
    create mask = 0644
    directory mask = 0755
 EOF
-
-( echo "$NAS_PASSWORD"; echo "$NAS_PASSWORD" ) | smbpasswd -s -a "$NAS_USERNAME"
+( echo "$NAS_PASS"; echo "$NAS_PASS" ) | smbpasswd -s -a "$NAS_USER"
 systemctl enable smbd
 systemctl restart smbd
 success "Samba configured"
 
 # -------------------------
-# Install Tailscale
-# -------------------------
-if ! command -v tailscale >/dev/null 2>&1; then
-    log "Installing Tailscale..."
-    curl -fsSL https://pkgs.tailscale.com/stable/install.sh | sh
-    systemctl enable tailscaled
-    systemctl start tailscaled
-    success "Tailscale installed"
-else
-    success "Tailscale already installed"
-fi
-
-# -------------------------
-# Power saving
+# Enable power saving
 # -------------------------
 systemctl enable tlp
 systemctl start tlp
 if command -v cpufreq-set >/dev/null; then
-    cpufreq-set -g powersave || warn "Failed to set CPU to powersave"
+    cpufreq-set -g powersave || warn "Failed to set CPU frequency to powersave"
 fi
-success "Power saving enabled"
+
+# -------------------------
+# Prevent lid close sleep
+# -------------------------
+LID_CONF="/etc/systemd/logind.conf"
+cp "$LID_CONF" "$LID_CONF.bak"
+sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/' "$LID_CONF"
+sed -i 's/^#*HandleLidSwitchExternalPower=.*/HandleLidSwitchExternalPower=ignore/' "$LID_CONF"
+sed -i 's/^#*HandleLidSwitchDocked=.*/HandleLidSwitchDocked=ignore/' "$LID_CONF"
+systemctl restart systemd-logind
 
 # -------------------------
 # Final status
 # -------------------------
 LAN_IP=$(hostname -I | awk '{print $1}' || echo "unknown")
-echo
 echo "=========================================="
 success "🎉 Installation completed!"
 echo "Home Assistant: http://${LAN_IP}:8123"
-echo "NAS share path: \\\\${LAN_IP}\\share"
-echo "NAS username/password: ${NAS_USERNAME} / ${NAS_PASSWORD}"
-echo "Tailscale: sudo tailscale up"
-echo "Logs: /var/log/install-cn.log"
+echo "NAS share: \\\\${LAN_IP}\\share"
+echo "NAS credentials: ${NAS_USER} / ${NAS_PASS}"
 echo "=========================================="
 exit 0
