@@ -1,251 +1,191 @@
 #!/bin/bash
-#==============================================================================
-# Debian12 NAS + Home Assistant (CN Enhanced) - install-cn.sh
-# Features:
-#   - Auto detect network, install Warp if GitHub unreachable
-#   - Install Docker via Tencent Cloud mirror (auto fallback to USTC)
-#   - Install Home Assistant Supervised via ghproxy
-#   - Configure secure Samba NAS share
-#   - Install Tailscale for remote access
-#   - Enable power saving (TLP + CPU powersave)
-#   - Prevent lid close sleep (for laptop NAS mode)
-# Usage:
-#   1. Save as ./install-cn.sh
-#   2. chmod +x install-cn.sh
-#   3. sudo ./install-cn.sh
-#==============================================================================
-
 set -euo pipefail
-IFS=$'\n\t'
 
-NAS_USERNAME="nasuser"
-NAS_PASSWORD="nas123456"
-DOCKER_REPO_TENCENT="https://mirrors.cloud.tencent.com/docker-ce"
-DOCKER_REPO_USTC="https://mirrors.ustc.edu.cn/docker-ce"
-HA_MACHINE_TYPE="generic-x86-64"
-WARP_SCRIPT="https://raw.githubusercontent.com/fscarmen/warp/main/menu.sh"
-GH_PROXY="https://ghproxy.com/https://github.com"
-LOGFILE="/var/log/install-cn.log"
+# ==========================================================
+# Clash.Meta CN 增强一键安装脚本（带自动代理检测 + Warp fallback）
+# 适用：Debian 12/13 x86_64
+# 作者：LesserFullness + GPT-5 助理
+# 功能：
+#   1. 自动检测 GitHub 访问
+#   2. 自动安装 Warp（若被墙）
+#   3. 自动下载 Clash.Meta（多镜像源）
+#   4. 自动安装 Dashboard（yacd）
+#   5. 设置 Systemd + 开机自启
+#   6. 自动配置系统全局代理
+# ==========================================================
 
-# -------------------------
-# Utility functions
-# -------------------------
-log() { echo "[$(date +'%F %T')] $*" | tee -a "$LOGFILE"; }
-warn() { echo -e "\033[33m[$(date +'%F %T')] ⚠️  $*\033[0m" | tee -a "$LOGFILE"; }
-error() { echo -e "\033[31m[$(date +'%F %T')] ❌ ERROR: $*\033[0m" | tee -a "$LOGFILE" >&2; exit 1; }
-success() { echo -e "\033[32m[$(date +'%F %T')] ✅ $*\033[0m" | tee -a "$LOGFILE"; }
+# ---------- 基本配置 ----------
+CLASH_DIR="/opt/clash"
+CLASH_BIN="/usr/local/bin/clash-meta"
+DASHBOARD_DIR="${CLASH_DIR}/dashboard"
+SERVICE_FILE="/etc/systemd/system/clash-meta.service"
+CONFIG_FILE="${CLASH_DIR}/config.yaml"
+SUBSCRIBE_URL="https://c.bbydy.org/api/bby/client/subscribe?token=fbbf3f0bb28e2f5fad03ac382aba5695"   # ← 请替换为你自己的订阅地址
+PROXY_PORT=7890
+HTTP_PORT=7891
 
-mkdir -p "$(dirname "$LOGFILE")" && touch "$LOGFILE" && chmod 644 "$LOGFILE"
-trap 'error "Script interrupted. Check log: $LOGFILE"' ERR
+# ---------- 输出格式 ----------
+log() { echo -e "\033[36m[$(date +'%H:%M:%S')] $1\033[0m"; }
+ok() { echo -e "\033[32m✅ $1\033[0m"; }
+warn() { echo -e "\033[33m⚠️  $1\033[0m"; }
+err() { echo -e "\033[31m❌ $1\033[0m" >&2; exit 1; }
 
-log "Starting installation: Debian12 NAS + Home Assistant (CN Enhanced)"
-
-# -------------------------
-# Step 0: Environment check
-# -------------------------
-if [ "$(id -u)" -ne 0 ]; then error "This script must be run as root"; fi
-
-if ! grep -qi "debian.*12" /etc/os-release; then
-    warn "System is not Debian 12. Continue anyway?"
-    read -rp "[y/N]: " yn
-    [[ ! "$yn" =~ ^[Yy]$ ]] && error "Aborted by user."
+# ---------- 检查 root ----------
+if [ "$(id -u)" -ne 0 ]; then
+  err "请以 root 身份运行：sudo bash $0"
 fi
 
-# -------------------------
-# Step 1: Network test
-# -------------------------
-log "Checking GitHub connectivity..."
-if curl -s --max-time 6 https://github.com >/dev/null 2>&1; then
-    success "GitHub reachable ✅"
+log "🚀 开始安装 Clash.Meta CN 增强版"
+
+# ---------- 安装依赖 ----------
+log "安装依赖..."
+apt update -y
+apt install -y curl wget unzip tar jq ca-certificates systemd
+
+# ---------- 检测 GitHub 连接 ----------
+log "检测 GitHub 连通性..."
+if curl -fs --connect-timeout 5 https://github.com > /dev/null 2>&1; then
+    ok "GitHub 可访问"
     USE_WARP=0
 else
-    warn "GitHub unreachable — installing Warp to enable proxy"
+    warn "GitHub 无法访问，将尝试安装 Cloudflare Warp"
     USE_WARP=1
 fi
 
-# -------------------------
-# Step 2: System update
-# -------------------------
-log "Updating system..."
-export DEBIAN_FRONTEND=noninteractive
-apt update -y && apt full-upgrade -y
-success "System updated successfully"
-
-# -------------------------
-# Step 3: Base dependencies
-# -------------------------
-log "Installing base dependencies..."
-apt install -y curl wget ca-certificates apt-transport-https gnupg lsb-release jq \
-    apparmor apparmor-utils avahi-daemon dbus network-manager \
-    systemd-journal-remote software-properties-common samba \
-    tlp cpufrequtils smartmontools bash-completion udisks2 || error "Dependency installation failed"
-success "Base dependencies installed"
-
-# -------------------------
-# Step 4: Install Warp (if needed)
-# -------------------------
+# ---------- 安装 Warp（如需要） ----------
 if [ "$USE_WARP" -eq 1 ]; then
-    log "Installing Cloudflare Warp..."
-    if curl -fsSL "$WARP_SCRIPT" -o /tmp/warp.sh; then
-        bash /tmp/warp.sh d || warn "Warp script exit non-zero"
-    else
-        warn "Primary Warp script failed, trying git.io"
-        curl -fsSL https://git.io/warp.sh | bash || warn "Fallback Warp install failed"
+    log "安装 Cloudflare Warp..."
+    if ! command -v warp &>/dev/null; then
+        apt install -y curl
+        bash <(curl -fsSL https://git.io/warp.sh) install
     fi
-
+    warp s || err "Warp 启动失败"
     sleep 5
-    if curl -s --max-time 8 https://github.com >/dev/null 2>&1; then
-        success "Warp enabled successfully, GitHub now accessible"
+
+    log "重新检测 GitHub..."
+    if curl -fs --connect-timeout 5 https://github.com > /dev/null 2>&1; then
+        ok "Warp 已生效，GitHub 可访问"
     else
-        error "Warp installed but GitHub still unreachable"
+        err "Warp 启动后仍无法访问 GitHub，请检查网络"
     fi
-else
-    log "Skipping Warp installation"
 fi
 
-# -------------------------
-# Step 5: Docker installation (Tencent → fallback USTC)
-# -------------------------
-if command -v docker >/dev/null 2>&1; then
-    success "Docker already installed, skipping"
-else
-    log "Installing Docker (Tencent Cloud mirror, GPG fix)"
-    mkdir -p /etc/apt/keyrings
-    if ! curl -fsSL ${DOCKER_REPO_TENCENT}/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
-        warn "Failed to get Tencent key, switching to USTC"
-        curl -fsSL ${DOCKER_REPO_USTC}/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || error "Cannot get Docker GPG key"
+# ---------- 创建目录 ----------
+mkdir -p "$CLASH_DIR"
+cd "$CLASH_DIR"
+
+# ---------- 自动镜像检测 ----------
+log "检测可用镜像源..."
+MIRRORS=(
+  "https://mirror.ghproxy.com/"
+  "https://gh-proxy.com/"
+  ""
+)
+
+DOWNLOAD_OK=0
+for MIRROR in "${MIRRORS[@]}"; do
+    log "尝试镜像：${MIRROR:-官方源}"
+    if curl -fsSL --connect-timeout 10 "${MIRROR}https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-compatible.gz" -o mihomo.gz; then
+        DOWNLOAD_OK=1
+        ok "成功使用镜像：${MIRROR:-官方源}"
+        break
+    else
+        warn "镜像 ${MIRROR:-官方源} 失败"
     fi
-    chmod a+r /etc/apt/keyrings/docker.gpg
+done
 
-    ARCH=$(dpkg --print-architecture)
-    CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+if [ "$DOWNLOAD_OK" -ne 1 ]; then
+    err "所有镜像均无法访问，请检查网络或手动配置代理"
+fi
 
-    echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] ${DOCKER_REPO_TENCENT}/linux/debian $CODENAME stable" > /etc/apt/sources.list.d/docker.list
+# ---------- 解压安装 ----------
+log "安装 Clash.Meta 二进制..."
+gzip -d mihomo.gz
+mv mihomo "$CLASH_BIN"
+chmod +x "$CLASH_BIN"
+ok "Clash.Meta 安装完成"
 
-    if ! apt update -y; then
-        warn "Tencent mirror failed, fallback to USTC"
-        echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] ${DOCKER_REPO_USTC}/linux/debian $CODENAME stable" > /etc/apt/sources.list.d/docker.list
-        apt update -y || error "Failed to update Docker source"
-    fi
+# ---------- 下载 Dashboard ----------
+log "安装 Dashboard（yacd）..."
+rm -rf "$DASHBOARD_DIR"
+mkdir -p "$DASHBOARD_DIR"
+if ! curl -fsSL --connect-timeout 10 https://gh-proxy.com/https://github.com/haishanh/yacd/archive/refs/heads/gh-pages.zip -o dashboard.zip; then
+    warn "主镜像失败，使用备用镜像..."
+    curl -fsSL https://mirror.ghproxy.com/https://github.com/haishanh/yacd/archive/refs/heads/gh-pages.zip -o dashboard.zip || err "Dashboard 下载失败"
+fi
+unzip -q dashboard.zip -d "$DASHBOARD_DIR"
+rm -f dashboard.zip
+ok "Dashboard 安装完成"
 
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || error "Docker installation failed"
+# ---------- 生成基础配置 ----------
+log "生成 Clash.Meta 基础配置..."
+cat > "$CONFIG_FILE" <<EOF
+mixed-port: ${PROXY_PORT}
+allow-lan: true
+bind-address: '*'
+mode: Rule
+log-level: info
+external-controller: 0.0.0.0:${HTTP_PORT}
+external-ui: ${DASHBOARD_DIR}/yacd-gh-pages
 
-    systemctl enable docker || warn "Cannot enable docker"
-    systemctl start docker || error "Cannot start docker"
-    mkdir -p /etc/docker
+proxy-providers:
+  mysub:
+    type: http
+    url: ${SUBSCRIBE_URL}
+    interval: 3600
+    path: ./subs/mysub.yaml
+    health-check:
+      enable: true
+      interval: 600
+      lazy: true
 
-    cat > /etc/docker/daemon.json <<EOF
-{
-  "registry-mirrors": [
-    "https://mirror.ccs.tencentyun.com",
-    "https://hub-mirror.c.163.com",
-    "https://registry.docker-cn.com"
-  ],
-  "max-concurrent-uploads": 3
-}
+rules:
+  - MATCH,Proxy
+EOF
+ok "配置文件生成完成：$CONFIG_FILE"
+
+# ---------- 创建 Systemd 服务 ----------
+log "创建 Systemd 服务..."
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Clash.Meta Proxy Service
+After=network.target
+
+[Service]
+ExecStart=${CLASH_BIN} -d ${CLASH_DIR}
+Restart=always
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl restart docker || warn "Docker restart failed"
-    success "Docker installed & registry mirrors configured"
-fi
+systemctl daemon-reload
+systemctl enable clash-meta
+systemctl restart clash-meta
+ok "Systemd 服务启动完成"
 
-# -------------------------
-# Step 6: Install Home Assistant Supervised
-# -------------------------
-if systemctl is-active --quiet home-assistant-supervised; then
-    success "Home Assistant already running"
-else
-    log "Installing Home Assistant Supervised..."
-    mkdir -p /opt/ha-install && cd /opt/ha-install
-    INSTALLER_URL="${GH_PROXY}/home-assistant/supervised-installer/releases/latest/download/installer.sh"
-    if curl -fLo installer.sh "$INSTALLER_URL"; then
-        chmod +x installer.sh
-        bash installer.sh --machine "$HA_MACHINE_TYPE" || warn "Installer exit non-zero"
-        systemctl enable home-assistant-supervised || warn "Enable failed"
-        success "Home Assistant installation completed"
-    else
-        error "Failed to download HA installer (ghproxy unreachable)"
-    fi
-fi
-
-# -------------------------
-# Step 7: Configure Samba NAS
-# -------------------------
-log "Setting up Samba NAS share..."
-if ! id "$NAS_USERNAME" >/dev/null 2>&1; then
-    useradd -m -s /usr/sbin/nologin "$NAS_USERNAME"
-fi
-echo "${NAS_USERNAME}:${NAS_PASSWORD}" | chpasswd
-
-mkdir -p /mnt/storage
-chown -R "$NAS_USERNAME:$NAS_USERNAME" /mnt/storage
-chmod 755 /mnt/storage
-
-cat > /etc/samba/smb.conf <<EOF
-[global]
-   workgroup = WORKGROUP
-   server string = HomeNAS
-   map to guest = Bad User
-   smb encrypt = auto
-   log file = /var/log/samba/log.%m
-   max log size = 1000
-   server role = standalone server
-
-[share]
-   comment = Home Assistant NAS Share
-   path = /mnt/storage
-   browseable = yes
-   read only = no
-   valid users = $NAS_USERNAME
-   guest ok = no
-   create mask = 0644
-   directory mask = 0755
+# ---------- 配置系统代理 ----------
+log "配置全局系统代理..."
+ENV_FILE="/etc/profile.d/clash-proxy.sh"
+cat > "$ENV_FILE" <<EOF
+export http_proxy="http://127.0.0.1:${PROXY_PORT}"
+export https_proxy="http://127.0.0.1:${PROXY_PORT}"
+export all_proxy="socks5://127.0.0.1:${PROXY_PORT}"
 EOF
+source "$ENV_FILE"
+ok "系统代理已启用"
 
-( echo "$NAS_PASSWORD"; echo "$NAS_PASSWORD" ) | smbpasswd -s -a "$NAS_USERNAME"
-systemctl enable smbd && systemctl restart smbd
-success "Samba NAS configured"
-
-# -------------------------
-# Step 8: Install Tailscale
-# -------------------------
-if command -v tailscale >/dev/null; then
-    success "Tailscale already installed"
-else
-    log "Installing Tailscale..."
-    curl -fsSL https://pkgs.tailscale.com/stable/install.sh | sh
-    systemctl enable --now tailscaled
-    success "Tailscale installed. Run 'sudo tailscale up' to login"
-fi
-
-# -------------------------
-# Step 9: Power saving & Lid close
-# -------------------------
-log "Configuring power saving..."
-systemctl enable --now tlp || warn "TLP failed"
-cpufreq-set -g powersave || warn "Failed to set CPU to powersave"
-
-log "Preventing lid close sleep..."
-CONF="/etc/systemd/logind.conf"
-sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/' "$CONF"
-sed -i 's/^#*HandleLidSwitchExternalPower=.*/HandleLidSwitchExternalPower=ignore/' "$CONF"
-sed -i 's/^#*HandleLidSwitchDocked=.*/HandleLidSwitchDocked=ignore/' "$CONF"
-systemctl restart systemd-logind || true
-success "Laptop NAS mode configured"
-
-# -------------------------
-# Done
-# -------------------------
-LAN_IP=$(hostname -I | awk '{print $1}')
+# ---------- 最终输出 ----------
 echo
 echo "=========================================="
-success "🎉 Installation completed!"
+echo "🎉 Clash.Meta 安装完成！"
 echo "=========================================="
-echo "🏠 Home Assistant: http://${LAN_IP}:8123"
-echo "📁 NAS share path: \\\\${LAN_IP}\\share"
-echo "🔐 NAS user/pass: ${NAS_USERNAME} / ${NAS_PASSWORD}"
-echo "🔗 Tailscale: sudo tailscale up"
+echo "📍 配置文件：$CONFIG_FILE"
+echo "🧩 Dashboard 地址：http://$(hostname -I | awk '{print $1}'):${HTTP_PORT}"
+echo "🌐 代理端口：HTTP/SOCKS5 = ${PROXY_PORT}"
+echo "🔄 订阅地址：${SUBSCRIBE_URL}"
+echo "⚙️  开机启动：systemctl enable clash-meta"
+echo "🧰  启停命令：systemctl restart clash-meta"
 echo "=========================================="
-success "System ready!"
-exit 0
+ok "Clash.Meta 已部署成功 ✅"
