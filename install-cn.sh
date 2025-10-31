@@ -1,185 +1,166 @@
 #!/bin/bash
-# =============================================================================
+#==============================================================================#
 # Debian12 NAS + Home Assistant + Mihomo (CN Enhanced)
-# 自动安装脚本（中国大陆网络增强版）
-# 功能：
-#   - Warp 代理 fallback
-#   - 国内 Docker 镜像 + GPG key 修复
-#   - Home Assistant Supervised
-#   - Mihomo
-#   - Samba NAS
-#   - Tailscale
-#   - 节能优化
-# 作者：YourName
-# =============================================================================
+# Features:
+#   - Detect network & WARP connection
+#   - Download dependencies via WARP if available
+#   - Install Docker (official)
+#   - Install Home Assistant Supervised
+#   - Configure Samba NAS
+#   - Install Tailscale
+#   - Power saving (TLP + CPU powersave)
+#==============================================================================#
 
 set -euo pipefail
 IFS=$'\n\t'
 
 # -------------------------
-# 配置参数
+# Configuration
 # -------------------------
 NAS_USERNAME="nasuser"
 NAS_PASSWORD="nas123456"
 HA_MACHINE_TYPE="generic-x86-64"
-Mihomo_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-compatible.gz"
-SUBSCRIBE_URL="https://c.bbydy.org/api/bby/client/subscribe?token=fbbf3f0bb28e2f5fad03ac382aba5695"
-
 LOGFILE="/var/log/install-cn.log"
 
-DOCKER_MIRRORS=(
-    "https://mirrors.aliyun.com/docker-ce/linux/debian"
-    "https://mirrors.cloud.tencent.com/docker-ce/linux/debian"
-    "https://hub-mirror.c.163.com/docker-ce/linux/debian"
-)
+# Mihomo / Clash or other dependencies download links
+MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-compatible.gz"
 
 # -------------------------
-# 日志函数
+# Logging functions
 # -------------------------
 log() { echo "[$(date +'%F %T')] $*" | tee -a "$LOGFILE"; }
+error() { echo -e "\033[31m[$(date +'%F %T')] ❌ ERROR: $*\033[0m" | tee -a "$LOGFILE" >&2; exit 1; }
 warn() { echo -e "\033[33m[$(date +'%F %T')] ⚠️ $*\033[0m" | tee -a "$LOGFILE"; }
-error() { echo -e "\033[31m[$(date +'%F %T')] ❌ $*\033[0m" | tee -a "$LOGFILE" >&2; exit 1; }
 success() { echo -e "\033[32m[$(date +'%F %T')] ✅ $*\033[0m" | tee -a "$LOGFILE"; }
 
+# Initialize log
 mkdir -p "$(dirname "$LOGFILE")"
 touch "$LOGFILE"
 chmod 644 "$LOGFILE"
-
-trap 'error "脚本中断，请查看日志: $LOGFILE"' ERR
-
-log "开始安装 Debian12 NAS + Home Assistant + Mihomo (CN增强版)"
+trap 'error "Script interrupted. Check log: $LOGFILE"' ERR
 
 # -------------------------
-# 系统检查
+# Ensure root
 # -------------------------
-if [ "$(id -u)" -ne 0 ]; then error "请以 root 执行"; fi
+if [ "$(id -u)" -ne 0 ]; then
+    error "Please run as root"
+fi
+
+# -------------------------
+# System check
+# -------------------------
 if ! grep -qi "debian.*12" /etc/os-release; then
-    warn "系统不是 Debian 12，可能存在兼容性问题"
-    read -r -p "是否继续？[y/N] " yn
-    [[ ! "$yn" =~ ^[Yy]$ ]] && error "用户取消"
+    warn "System is not Debian 12. Continue at your own risk."
+    read -r -p "Continue? [y/N]: " yn
+    [[ ! "$yn" =~ ^[Yy]$ ]] && error "User cancelled"
 fi
 
+log "Starting installation: Debian12 NAS + Home Assistant + Mihomo"
+
 # -------------------------
-# Step 0: 检测 GitHub
+# Check WARP
 # -------------------------
-log "检测 GitHub 连通性..."
-if ping -c 2 github.com >/dev/null 2>&1 || curl -s --max-time 5 https://github.com >/dev/null 2>&1; then
-    success "GitHub 可访问"
-    USE_WARP=0
+USE_WARP=0
+if command -v warp-cli >/dev/null 2>&1; then
+    WARP_STATUS=$(warp-cli status 2>/dev/null | grep -i "Status update" | awk '{print $3}' || echo "Disconnected")
+    if [[ "$WARP_STATUS" == "Connected" ]]; then
+        log "WARP 已连接，可用于下载被墙资源"
+        USE_WARP=1
+    else
+        warn "WARP 未连接，下载墙外资源可能失败"
+    fi
 else
-    warn "GitHub 不可访问，将使用 Warp"
-    USE_WARP=1
+    warn "未安装 WARP CLI，可选安装 https://pkg.cloudflareclient.com/"
 fi
 
 # -------------------------
-# Step 1: 系统更新
+# Helper download function
 # -------------------------
-log "更新系统..."
+download_with_warp() {
+    local URL="$1"
+    local OUTPUT="$2"
+    if [[ "$USE_WARP" -eq 1 ]]; then
+        curl -L --retry 5 --connect-timeout 10 "$URL" -o "$OUTPUT" || error "下载失败: $URL"
+    else
+        curl -L --retry 5 --connect-timeout 10 "$URL" -o "$OUTPUT" || warn "下载失败（未使用 WARP）: $URL"
+    fi
+}
+
+# -------------------------
+# Update system
+# -------------------------
+log "Updating system..."
 export DEBIAN_FRONTEND=noninteractive
 apt update -y
 apt full-upgrade -y
-success "系统更新完成"
+success "System updated"
 
 # -------------------------
-# Step 2: 安装基础依赖
+# Install base dependencies
 # -------------------------
-log "安装基础依赖..."
-apt install -y curl wget ca-certificates gnupg lsb-release jq apparmor \
-    apparmor-utils avahi-daemon dbus network-manager systemd-journal-remote \
-    software-properties-common samba tlp cpufrequtils smartmontools bash-completion
-success "基础依赖安装完成"
+log "Installing base dependencies..."
+apt install -y curl wget ca-certificates apt-transport-https gnupg lsb-release \
+    jq apparmor apparmor-utils avahi-daemon dbus network-manager \
+    systemd-journal-remote software-properties-common \
+    samba tlp cpufrequtils smartmontools bash-completion || error "Dependencies failed"
+success "Base dependencies installed"
 
 # -------------------------
-# Step 3: Warp 安装（如需要）
+# Install Docker
 # -------------------------
-if [ "$USE_WARP" -eq 1 ]; then
-    log "安装 Cloudflare Warp..."
-    if curl -fsSL https://git.io/warp.sh | bash -s -- -y; then
-        warp s || warn "warp 启动失败"
-    fi
-    if curl -s --max-time 6 https://github.com >/dev/null 2>&1; then
-        success "Warp 启用，GitHub 可访问"
-    else
-        error "Warp 安装后 GitHub 仍不可访问"
-    fi
-else
-    log "跳过 Warp 安装"
-fi
+log "Installing Docker..."
+mkdir -p /etc/apt/keyrings
+download_with_warp "https://download.docker.com/linux/debian/gpg" /etc/apt/keyrings/docker.gpg
 
-# -------------------------
-# Step 4: 安装 Docker（国内镜像 + key 自动修复）
-# -------------------------
-log "安装 Docker..."
 ARCH=$(dpkg --print-architecture)
-CODENAME=$(lsb_release -cs)
+CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $CODENAME stable" > /etc/apt/sources.list.d/docker.list
 
-for MIRROR in "${DOCKER_MIRRORS[@]}"; do
-    log "尝试镜像: $MIRROR"
-    if curl -sSf "$MIRROR/gpg" -o /etc/apt/keyrings/docker.gpg; then
-        echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] $MIRROR $CODENAME stable" \
-            > /etc/apt/sources.list.d/docker.list
-        if apt update -y; then
-            success "镜像可用: $MIRROR"
-            break
-        fi
-    fi
-done
-
-# 如果仍然不可用，使用官方源
-if ! apt update -y; then
-    warn "国内镜像不可用，使用官方源 + Warp"
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $CODENAME stable" \
-        > /etc/apt/sources.list.d/docker.list
-    apt update -y
-fi
-
-apt install -y docker-ce docker-ce-cli containerd.io
+apt update -y
+apt install -y docker-ce docker-ce-cli containerd.io || error "Docker installation failed"
 systemctl enable docker
 systemctl start docker
-success "Docker 安装完成"
+success "Docker installed"
 
 # -------------------------
-# Step 5: Home Assistant Supervised
+# Install Home Assistant Supervised
 # -------------------------
-log "安装 Home Assistant Supervised..."
+log "Installing Home Assistant Supervised..."
 mkdir -p /opt/ha-install
 cd /opt/ha-install
-curl -fsSL https://ghproxy.com/https://github.com/home-assistant/supervised-installer/releases/latest/download/installer.sh -o installer.sh
+download_with_warp "https://ghproxy.com/https://github.com/home-assistant/supervised-installer/releases/latest/download/installer.sh" installer.sh
 chmod +x installer.sh
-bash installer.sh --machine "$HA_MACHINE_TYPE"
-systemctl enable home-assistant-supervised
-success "Home Assistant 安装完成"
+bash installer.sh --machine "$HA_MACHINE_TYPE" || warn "HA installer returned non-zero"
+success "HA installation attempted"
 
 # -------------------------
-# Step 6: Mihomo 下载
+# Download Mihomo
 # -------------------------
-log "下载 Mihomo..."
+log "Downloading Mihomo..."
 mkdir -p /opt/mihomo
-curl -fLo /opt/mihomo/mihomo.gz "$Mihomo_URL" || warn "Mihomo 下载失败"
-gunzip -f /opt/mihomo/mihomo.gz
+download_with_warp "$MIHOMO_URL" /opt/mihomo/mihomo.gz
+gzip -d /opt/mihomo/mihomo.gz
 chmod +x /opt/mihomo/mihomo
-success "Mihomo 安装完成"
+success "Mihomo downloaded"
 
 # -------------------------
-# Step 7: 配置 Samba NAS
+# Configure Samba NAS
 # -------------------------
-log "配置 Samba NAS..."
+log "Configuring Samba NAS..."
 if id "$NAS_USERNAME" >/dev/null 2>&1; then
-    warn "用户 $NAS_USERNAME 已存在，更新密码"
+    warn "User $NAS_USERNAME exists, updating password"
     echo "${NAS_USERNAME}:${NAS_PASSWORD}" | chpasswd
 else
     useradd -m -s /usr/sbin/nologin "$NAS_USERNAME"
     echo "${NAS_USERNAME}:${NAS_PASSWORD}" | chpasswd
-    success "创建 NAS 用户: $NAS_USERNAME"
+    success "Created NAS user"
 fi
 
 mkdir -p /mnt/storage
 chown -R "$NAS_USERNAME:$NAS_USERNAME" /mnt/storage
 chmod 755 /mnt/storage
 
-cat >/etc/samba/smb.conf <<EOF
+cat > /etc/samba/smb.conf <<EOF
 [global]
    workgroup = WORKGROUP
    server string = HomeNAS
@@ -187,6 +168,8 @@ cat >/etc/samba/smb.conf <<EOF
    smb encrypt = auto
    log file = /var/log/samba/log.%m
    max log size = 1000
+   server role = standalone server
+
 [share]
    comment = Home Assistant NAS Share
    path = /mnt/storage
@@ -201,40 +184,42 @@ EOF
 ( echo "$NAS_PASSWORD"; echo "$NAS_PASSWORD" ) | smbpasswd -s -a "$NAS_USERNAME"
 systemctl enable smbd
 systemctl restart smbd
-success "Samba 配置完成"
+success "Samba configured"
 
 # -------------------------
-# Step 8: 安装 Tailscale
+# Install Tailscale
 # -------------------------
-if ! command -v tailscale >/dev/null; then
-    log "安装 Tailscale..."
+if ! command -v tailscale >/dev/null 2>&1; then
+    log "Installing Tailscale..."
     curl -fsSL https://pkgs.tailscale.com/stable/install.sh | sh
     systemctl enable tailscaled
     systemctl start tailscaled
-    success "Tailscale 安装完成"
+    success "Tailscale installed"
 else
-    success "Tailscale 已安装"
+    success "Tailscale already installed"
 fi
 
 # -------------------------
-# Step 9: 节能优化
+# Power saving
 # -------------------------
-log "启用节能模式..."
-systemctl enable tlp || warn "无法启用 TLP"
-systemctl start tlp || warn "无法启动 TLP"
-command -v cpufreq-set >/dev/null && cpufreq-set -g powersave && success "CPU 设置为 powersave"
+systemctl enable tlp
+systemctl start tlp
+if command -v cpufreq-set >/dev/null; then
+    cpufreq-set -g powersave || warn "Failed to set CPU to powersave"
+fi
+success "Power saving enabled"
 
 # -------------------------
-# Step 10: 防止笔记本盖上睡眠
+# Final status
 # -------------------------
-log "配置 lid close ignore..."
-LID_CONF="/etc/systemd/logind.conf"
-cp "$LID_CONF" "${LID_CONF}.bak" || true
-sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/' "$LID_CONF"
-sed -i 's/^#*HandleLidSwitchExternalPower=.*/HandleLidSwitchExternalPower=ignore/' "$LID_CONF"
-sed -i 's/^#*HandleLidSwitchDocked=.*/HandleLidSwitchDocked=ignore/' "$LID_CONF"
-systemctl restart systemd-logind || warn "logind restart 失败"
-
-# -------------------------
-# 完成提示
-# -------------------------
+LAN_IP=$(hostname -I | awk '{print $1}' || echo "unknown")
+echo
+echo "=========================================="
+success "🎉 Installation completed!"
+echo "Home Assistant: http://${LAN_IP}:8123"
+echo "NAS share path: \\\\${LAN_IP}\\share"
+echo "NAS username/password: ${NAS_USERNAME} / ${NAS_PASSWORD}"
+echo "Tailscale: sudo tailscale up"
+echo "Logs: /var/log/install-cn.log"
+echo "=========================================="
+exit 0
